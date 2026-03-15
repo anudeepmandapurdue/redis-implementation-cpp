@@ -18,7 +18,11 @@
 // C++
 #include <string>
 #include <vector>
-#include <map>
+// proj
+#include "hashtable.h"
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 const size_t k_max_msg = 32 << 20; //max message size?
 
@@ -47,6 +51,27 @@ struct Response{
     uint32_t status = 0; //returns the status in integer -> maps to differnet meanings
     std::vector<uint8_t> data; //holds teh actual value in raw byte format
 };
+
+//global variable that stores the database
+//main hash table that stores all keys and values
+static struct {
+    HMap db;    // top-level hashtable
+} g_data;
+
+// KV pair for the top-level hashtable
+// represetns one redis key value pair
+//Example: 
+    //SET name "alice"
+    //node 
+    //key = "name"
+    //val = "alice"
+struct Entry {
+    struct HNode node;  // hashtable node
+    std::string key;
+    std::string val;
+};
+
+
 // =============================================================================
 // 3. PRIMITIVE HELPERS (Byte Manipulation)
 // =============================================================================
@@ -79,6 +104,11 @@ static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) { /
     cur += 4;
     return true;
 
+}
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node); //lhs pointer to the node. container find teh entry struct that contains the node
+    struct Entry *re = container_of(rhs, struct Entry, node); //rhs " " 
+    return le->key == re->key; //returns true or false based on whether the keys are the same
 }
 // =============================================================================
 // 4. PROTOCOL LAYER (Parsing & Serialization)
@@ -120,31 +150,83 @@ static void make_response(const Response &resp, std::vector<uint8_t> &out) {
     buf_append(out, resp.data.data(), resp.data.size());
 }
 
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
 
 // =============================================================================
 // 5. APPLICATION LAYER (KV Store Logic)
 // =============================================================================
 
+//command that is being passed and the response that is returned by it
+static void do_get(std::vector<std::string> &cmd, Response &out){
+    //custom hash table that strings the string from the users command into the fake entry
+    //calculate the hash code of the string and store it in the node
+    Entry key;
+    key.key.swap(cmd[1]); //copy the string from the command into the dummy entry
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size()); // calculate the hash code of the string, hcdoe stored inside teh HNode
+    //lookup using the database, target node, and the equality function to prevent collisions
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);//core search function, found two nodes with the same hash are their actual string equal
+    if(!node){
+        out.status = RES_NX;
+        return;
+    }
+    //copy the value into container 
+    const std::string &val = container_of(node, Entry, node)->val ;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &out){
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);//core search function, found two nodes with the same hash are their actual string equal
+    if(node){
+        //if found update the value
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+        out.status = RES_OK;
+    }
+    else{
+        // not found allocate and insert a new pair
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+
+    out.status = RES_OK;
+}
 
 
-static std::map<std::string, std::string> g_data; //key value store
+static void do_del(std::vector<std::string> &cmd, Response &out){
+    Entry key; 
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if(node){
+        delete container_of(node, Entry,node);
+        out.status = RES_OK;
 
+    }
+    else{
+        out.status = RES_NX;
+    }
+}
 static void do_request(std::vector<std::string> &cmd, Response &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = g_data.find(cmd[1]);
-        if (it == g_data.end()) {
-            out.status = RES_NX;
-            return;
-        }
-        out.status = RES_OK; // Be explicit
-        const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        g_data[cmd[1]].swap(cmd[2]);
-        out.status = RES_OK; // Be explicit
+        return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        g_data.erase(cmd[1]);
-        out.status = RES_OK; // Be explicit
+        return do_del(cmd, out);
     } else {
         out.status = RES_ERR;
     }
@@ -331,6 +413,8 @@ static int32_t one_request(int connfd){
     memcpy(&wbuf[4], reply, len);
     return write_all(connfd, wbuf, 4 + len);
 }
+
+
 //read and write 
 
 //append to the back 
@@ -473,7 +557,7 @@ int main(){
             if (ready & POLLIN){
                 handle_read(conn); // read since POLLIN is true
             }
-            if (ready & POLLOUT){
+            if (ready & POLLOUT && !conn->want_close){
                 handle_write(conn); //write since POLLOUT is true
 
             }
