@@ -5,12 +5,24 @@
 
 
 // hashtable node, should be embedded into the payload
+//linked list node stored in the hash bucket
 struct HNode {
     HNode *next = NULL;
     uint64_t hcode = 0;
 };
 
 // a simple fixed-sized hashtable
+//array of buckets
+/*
+tab (array of buckets)
+
+tab[0] -> linked list
+tab[1] -> linked list
+tab[2] -> linked list
+*/
+struct HTab {
+    HNode **tab = NULL; // array of slots
+    size_t mask = 0;    // power of 2 array size, 2^n - 1, mask faster than modulo
 struct HTab {
     HNode **tab = NULL; // array of slots
     size_t mask = 0;    // power of 2 array size, 2^n - 1
@@ -19,6 +31,9 @@ struct HTab {
 
 // the real hashtable interface.
 // it uses 2 hashtables for progressive rehashing.
+// progressive rehashing
+struct HMap {
+    HTab newer; //copies a few keys per operation to prevent freezing the server 
 struct HMap {
     HTab newer;
     HTab older;

@@ -4,6 +4,21 @@
 
 
 // n must be a power of 2
+// initialize, creates the table
+static void h_init(HTab *htab, size_t n) { //pointer to the hashtable struct we want to initialize, n-> number of buckets in the table
+    assert(n > 0 && ((n - 1) & n) == 0); //n must be a power of two
+    htab->tab = (HNode **)calloc(n, sizeof(HNode *)); //initialize as NULL
+    htab->mask = n - 1;
+    htab->size = 0;
+
+    //creates an empty hash table skeleton 
+}
+
+// hashtable insertion
+static void h_insert(HTab *htab, HNode *node) { //pointer to the hashtable and node that you want to add
+    size_t pos = node->hcode & htab->mask; //compute bucket
+    HNode *next = htab->tab[pos]; //gets the head of the bucket list 
+    node->next = next; // link the node to the previous head
 static void h_init(HTab *htab, size_t n) {
     assert(n > 0 && ((n - 1) & n) == 0);
     htab->tab = (HNode **)calloc(n, sizeof(HNode *));
@@ -21,6 +36,15 @@ static void h_insert(HTab *htab, HNode *node) {
 }
 
 // hashtable look up subroutine.
+// *htab is the pointer to the hashtable
+//*key is the node containing the key that we are searching for 
+// eq compares the two nodes
+static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    if (!htab->tab) {
+        return NULL;
+    } // check if table exists
+
+    size_t pos = key->hcode & htab->mask; //which bucket to search
 // Pay attention to the return value. It returns the address of
 // the parent pointer that owns the target node,
 // which can be used to delete the target node.
@@ -65,6 +89,7 @@ static void hm_help_rehashing(HMap *hmap) {
     // discard the old table if done
     if (hmap->older.size == 0 && hmap->older.tab) {
         free(hmap->older.tab);
+        hmap->older = HTab();
         hmap->older = HTab{};
     }
 }
@@ -117,6 +142,7 @@ HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
 void hm_clear(HMap *hmap) {
     free(hmap->newer.tab);
     free(hmap->older.tab);
+    *hmap = HMap();
     *hmap = HMap{};
 }
 
