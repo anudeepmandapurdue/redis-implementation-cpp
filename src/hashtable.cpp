@@ -19,6 +19,18 @@ static void h_insert(HTab *htab, HNode *node) { //pointer to the hashtable and n
     size_t pos = node->hcode & htab->mask; //compute bucket
     HNode *next = htab->tab[pos]; //gets the head of the bucket list 
     node->next = next; // link the node to the previous head
+static void h_init(HTab *htab, size_t n) {
+    assert(n > 0 && ((n - 1) & n) == 0);
+    htab->tab = (HNode **)calloc(n, sizeof(HNode *));
+    htab->mask = n - 1;
+    htab->size = 0;
+}
+
+// hashtable insertion
+static void h_insert(HTab *htab, HNode *node) {
+    size_t pos = node->hcode & htab->mask;
+    HNode *next = htab->tab[pos];
+    node->next = next;
     htab->tab[pos] = node;
     htab->size++;
 }
@@ -33,6 +45,15 @@ static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *)) {
     } // check if table exists
 
     size_t pos = key->hcode & htab->mask; //which bucket to search
+// Pay attention to the return value. It returns the address of
+// the parent pointer that owns the target node,
+// which can be used to delete the target node.
+static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    if (!htab->tab) {
+        return NULL;
+    }
+
+    size_t pos = key->hcode & htab->mask;
     HNode **from = &htab->tab[pos];     // incoming pointer to the target
     for (HNode *cur; (cur = *from) != NULL; from = &cur->next) {
         if (cur->hcode == key->hcode && eq(cur, key)) {
@@ -69,6 +90,7 @@ static void hm_help_rehashing(HMap *hmap) {
     if (hmap->older.size == 0 && hmap->older.tab) {
         free(hmap->older.tab);
         hmap->older = HTab();
+        hmap->older = HTab{};
     }
 }
 
@@ -121,6 +143,7 @@ void hm_clear(HMap *hmap) {
     free(hmap->newer.tab);
     free(hmap->older.tab);
     *hmap = HMap();
+    *hmap = HMap{};
 }
 
 size_t hm_size(HMap *hmap) {

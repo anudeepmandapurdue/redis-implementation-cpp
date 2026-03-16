@@ -23,6 +23,9 @@ tab[2] -> linked list
 struct HTab {
     HNode **tab = NULL; // array of slots
     size_t mask = 0;    // power of 2 array size, 2^n - 1, mask faster than modulo
+struct HTab {
+    HNode **tab = NULL; // array of slots
+    size_t mask = 0;    // power of 2 array size, 2^n - 1
     size_t size = 0;    // number of keys
 };
 
@@ -31,6 +34,8 @@ struct HTab {
 // progressive rehashing
 struct HMap {
     HTab newer; //copies a few keys per operation to prevent freezing the server 
+struct HMap {
+    HTab newer;
     HTab older;
     size_t migrate_pos = 0;
 };
