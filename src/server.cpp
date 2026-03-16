@@ -25,6 +25,7 @@
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
 const size_t k_max_msg = 32 << 20; //max message size?
+const size_t k_max_args = 200 * 1000;
 
 enum {
     RES_OK = 0,
@@ -79,6 +80,10 @@ static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
 }
 
+static void msg_errno(const char *msg) {
+    fprintf(stderr, "[errno:%d] %s\n", errno, msg);
+}
+
 static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len){
     buf.insert(buf.end(), data, data + len); //adds at the end of the buffer
 }
@@ -122,7 +127,7 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
         return -1;
     }
 
-    if(nstr > k_max_msg){
+    if(nstr > k_max_args){
         return -1; //too long fails
     }
 
@@ -163,20 +168,18 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
 // 5. APPLICATION LAYER (KV Store Logic)
 // =============================================================================
 
-//command that is being passed and the response that is returned by it
 static void do_get(std::vector<std::string> &cmd, Response &out){
-    //custom hash table that strings the string from the users command into the fake entry
-    //calculate the hash code of the string and store it in the node
+
     Entry key;
-    key.key.swap(cmd[1]); //copy the string from the command into the dummy entry
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size()); // calculate the hash code of the string, hcdoe stored inside teh HNode
-    //lookup using the database, target node, and the equality function to prevent collisions
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);//core search function, found two nodes with the same hash are their actual string equal
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if(!node){
         out.status = RES_NX;
         return;
     }
-    //copy the value into container 
+
     const std::string &val = container_of(node, Entry, node)->val ;
     assert(val.size() <= k_max_msg);
     out.data.assign(val.begin(), val.end());
@@ -187,14 +190,13 @@ static void do_set(std::vector<std::string> &cmd, Response &out){
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);//core search function, found two nodes with the same hash are their actual string equal
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
     if(node){
-        //if found update the value
         container_of(node, Entry, node)->val.swap(cmd[2]);
         out.status = RES_OK;
     }
     else{
-        // not found allocate and insert a new pair
         Entry *ent = new Entry();
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
@@ -240,329 +242,236 @@ static void do_request(std::vector<std::string> &cmd, Response &out) {
 
 
 static void fd_set_nb(int fd){
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); // make the listening scoket non blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    if(flags < 0){
+        die("fcntl");
+    }
 
-    //non blocking means check if something happened, otehrwise keep going, do not wait until something happens
-    //allows for multiple threads to be active. 
+    flags |= O_NONBLOCK;
+
+    if(fcntl(fd, F_SETFL, flags) < 0){
+        die("fcntl");
+    }
 }
 
-
-
-//process 1 request if there is enough data
 static bool try_one_request(Conn *conn){
-    if (conn->incoming.size() < 4){//message is at least 4 bytes long with the length header, if less than 4 then its not done recieving the bytes
-        return false; //want read
+    if (conn->incoming.size() < 4){
+        return false;
     }
 
     uint32_t len = 0;
-    memcpy(&len, conn->incoming.data(), 4);//returns length of the message to len, recieves incoming data
+    memcpy(&len, conn->incoming.data(), 4);
+
     if(len > k_max_msg){
+        msg("too long");
         conn->want_close = true;
-        return false; //want close
+        return false;
     }
 
-    if( 4 + len > conn->incoming.size()){//length of the message and size of the message do not match up 
-        return false; //want read
+    if( 4 + len > conn->incoming.size()){
+        return false;
     }
 
-    //building response
-    const uint8_t *request = &conn->incoming[4]; //pointer to the fist byter buffer of the message body
-     // got one request, do some application logic
+    const uint8_t *request = &conn->incoming[4];
+
     std::vector<std::string> cmd;
     if (parse_req(request, len, cmd) < 0) {
         msg("bad request");
         conn->want_close = true;
-        return false;   // want close
+        return false;
     }
+
     Response resp;
     do_request(cmd, resp);
     make_response(resp, conn->outgoing);
 
-    // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
-    // Q: Why not just empty the buffer? See the explanation of "pipelining".
     return true;   
 }
 
 static Conn *handle_accept(int fd){
-    //accept
+
     struct sockaddr_in client_addr = {};
     socklen_t addrlen = sizeof(client_addr);
     int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+
     if (connfd < 0){
+        msg_errno("accept() error");
         return NULL;
     }
 
-    //set new connection fd to non blocking mode
     fd_set_nb(connfd);
 
-    //create a Conn struct
     Conn *conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true;
-    //no conn want_write because buffer is empty
+
     return conn;
 
 }
+
 static void handle_write(Conn *conn);
+
 static void handle_read(Conn *conn){
     uint8_t buf[64*1024];
     ssize_t rv = read(conn->fd, buf, sizeof(buf));
+
     if (rv < 0 && errno == EAGAIN) return;
-    if (rv <= 0){
+
+    if (rv < 0){
+        msg_errno("read() error");
         conn->want_close = true;
-       
+        return;
+    }
+
+    if (rv == 0){
+        if (conn->incoming.size() == 0){
+            msg("client closed");
+        } else{
+            msg("unexpected EOF");
+        }
+        conn->want_close = true;
         return;
     }
 
     buf_append(conn->incoming, buf, (size_t)rv);
-    while (try_one_request(conn)) {} 
+
+    while (try_one_request(conn)) {}
 
     if (conn->outgoing.size() > 0) {
         conn->want_read = false;
-        conn->want_write = true; // Set to true, but don't necessarily turn off read
+        conn->want_write = true;
         handle_write(conn);
     }
 }
 
 static void handle_write(Conn *conn){
     assert(conn->outgoing.size() >0);
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size()); //writing data and size to fd (socket handle)
+
+    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
     if (rv < 0 && errno == EAGAIN){
         return;
     }
+
     if (rv < 0){
-        conn->want_close = true; //error handling no more bytes to write into
+        msg_errno("write() error");
+        conn->want_close = true;
         return;
     }
+
     buf_consume(conn->outgoing, (size_t)rv);
-    // update the readiness intention
-    if (conn->outgoing.size() == 0) {   // all data written
+
+    if (conn->outgoing.size() == 0){
         conn->want_read = true;
         conn->want_write = false;
-    } // else: want write
+    }
 }
 
-//MISCELLANOUS (USED PREVIOUSLY)
 void die(const char* msg) {
     perror(msg);
     exit(1);
 }
 
 
-//reads now nonblocking so not needed but good to have
-//blocking helpers not used right now 
-static int32_t read_full(int fd, char *buf, size_t n ){
-    while (n>0){
-        ssize_t rv = read(fd, buf, n);
-        if(rv <= 0){
-            return -1;
-        }
-        assert((size_t)rv <= n );
-        n -= (size_t)rv;
-        buf += rv;
-        
-    }
-    return 0;
-}
-static int32_t write_all(int fd, char *buf, size_t n){
-    while (n >0){
-        ssize_t rv = write(fd, buf, n );
-
-    
-     assert((size_t)rv <= n );
-        n -= (size_t)rv;
-        buf += rv;
-        
-    }
-    return 0;
-}
-// read and write to the connected socket handle
-// unused because uses blocking read and write
-static int32_t one_request(int connfd){
-    //4 butes header
-    char rbuf[4+k_max_msg]; //actual content ignoring the buffer
-    errno = 0;
-    int32_t err = read_full(connfd, rbuf, 4);
-
-    if(err){
-        msg(errno == 0 ? "EOF": "read() error");
-        return err;
-    }
-
-    uint32_t len = 0;
-    memcpy(&len, rbuf, 4); //extracts length of the message, number of bytes of payload to read next
-    if (len > k_max_msg){
-        msg("too long");
-        return -1;
-    }
-
-    //request body
-    err = read_full(connfd, &rbuf[4], len);
-    if(err){
-        msg("read() error");
-        return err; 
-    }
-    //do something 
-    printf("client says: %.*s\n", len, &rbuf[4]);
-    // reply using the same protocol
-    const char reply[] = "world";
-    char wbuf[4 + sizeof(reply)];
-    len = (uint32_t)strlen(reply);
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connfd, wbuf, 4 + len);
-}
-
-
-//read and write 
-
-//append to the back 
-//args: buffer, pointer to 
-
-
 int main(){
-    //socket handle
-    int fd = socket(AF_INET, SOCK_STREAM, 0); //AF_INET is from IPv4, inet6 for IPV6, sock strem is for TCP
 
-    //set socket options
-    //2nd and 3rd arugments specifies which option to set
-    //4th arg option value ie: 1
-    //always set SO_REUSEADDR to be 1 or it wont be able to bind to same IP:port after a restart, keep convention for all listening ports
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-    //bind to an address 0.0.0.0:1234 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234); //port
-    addr.sin_addr.s_addr = htonl(0); //wildcard IP 0.0.0.0
-    int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    addr.sin_port = htons(1234);
+    addr.sin_addr.s_addr = htonl(0);
 
+    int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) { die("bind()"); }
 
-    fd_set_nb(fd); //set listening socket to non blocking
+    fd_set_nb(fd);
 
- 
-    //listen 
-    rv = listen(fd, SOMAXCONN); //SOMAXCONN is 4096 on linux
+    rv = listen(fd, SOMAXCONN);
     if (rv) {die("listen()");};
 
-
-    /* CONSTRUCT THE EVNET LOOP*/
-    //fd is the listening socket
-    // essentially a hashmap of all connections as the value for the fd key
-    std::vector<Conn *> fd2conn; //map of all client connection keyed by fd
-
-    //poll is Linux API, takes a list of fd that program wants IO on, returns a list of fds that are ready for IO 
-
-
-    //event loop
+    std::vector<Conn *> fd2conn;
     std::vector<struct pollfd> poll_args;
+
     while (true) {
-    // --------------------------------------------------
-    // STEP 1: Build the list of sockets to monitor
-    // --------------------------------------------------
-    // poll() does NOT know about your connections.
-    // You must give it a list every iteration.
-    // So we rebuild the list each loop.
-    poll_args.clear();
 
-    // --------------------------------------------------
-    // STEP 1A: Add the listening socket
-    // --------------------------------------------------
-    // Why first?
-    // Because index 0 is reserved for accepting new clients.
-    // We want poll() to notify us when:
-    // "A new client is trying to connect"
-    struct pollfd pfd = {
-        fd,        // socket to monitor
-        POLLIN,    // we want to know when it is readable
-        0          // OS writes readiness result here
-    };
+        poll_args.clear();
 
-    poll_args.push_back(pfd);
-
-    // --------------------------------------------------
-    // STEP 1B: Add all existing client connections
-    // --------------------------------------------------
-    // fd2conn maps fd → Conn object.
-    // Each Conn tells us what it wants:
-    // - read more data?
-    // - write pending response?
-    for (Conn *conn : fd2conn) {
-
-        // Skip empty slots in the fd map
-        if (!conn) {
-            continue;
-        }
-
-        // We ALWAYS monitor errors
-        // because a broken socket must be closed.
         struct pollfd pfd = {
-            conn->fd,   // client's socket
-            POLLERR,    // always check errors
+            fd,
+            POLLIN,
             0
         };
 
-        // If application wants to READ from socket
-        if (conn->want_read) {
-            pfd.events |= POLLIN;
-        }
-
-        // If application has data to WRITE
-        if (conn->want_write) {
-            pfd.events |= POLLOUT;
-        }
-
-        // Add this socket to the OS watch list
         poll_args.push_back(pfd);
-    }
 
-    // After this point:
-    // poll_args contains ALL sockets the server cares about.
-    
+        for (Conn *conn : fd2conn) {
 
-        //wait for readiness   
-        //poll can return when at least one of the fds are ready
-        //OR when err = EINTR, allows process a chance to handle the signal 
+            if (!conn) {
+                continue;
+            }
+
+            struct pollfd pfd = {
+                conn->fd,
+                POLLERR,
+                0
+            };
+
+            if (conn->want_read) {
+                pfd.events |= POLLIN;
+            }
+
+            if (conn->want_write) {
+                pfd.events |= POLLOUT;
+            }
+
+            poll_args.push_back(pfd);
+        }
+
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+
         if(rv < 0 && errno == EINTR){
             continue;
         }
+
         if (rv < 0){
             die("poll");
         }  
 
-        //Invoke Application Callbacks
-        //accept treated as readiness notification -> POLLIN
-        //poll returns and check the 1st fd if we can accept
-        if (poll_args[0].revents & POLLIN){
+        if (poll_args[0].revents){
             Conn *conn = handle_accept(fd);
+
             if (conn){
                 if (fd2conn.size() <= (size_t)conn->fd){
                     fd2conn.resize(conn->fd + 1);
                 }
+
                 fd2conn[conn->fd] = conn;
             }
         }
 
-        for (size_t i = 1; i < poll_args.size(); ++i){ //skip first poll argument 
+        for (size_t i = 1; i < poll_args.size(); ++i){
+
             uint32_t ready = poll_args[i].revents;
-            if (ready == 0) { // Add this line to skip idle sockets
+
+            if (ready == 0){
                 continue;
             }
-            // copies readiness flags returned by OS, revents is a bitmask that continas multiple flags
-            Conn *conn = fd2conn[poll_args[i].fd]; //finds the connection state object for that socket, given socket number find the state of the client
-            if (ready & POLLIN){
-                handle_read(conn); // read since POLLIN is true
-            }
-            if (ready & POLLOUT && !conn->want_close){
-                handle_write(conn); //write since POLLOUT is true
 
+            Conn *conn = fd2conn[poll_args[i].fd];
+
+            if (ready & POLLIN){
+                handle_read(conn);
             }
-            //terminate connections, destroy connect with error or if request want_close
-            // close the socket from socket error or applicatoin logic
+
+            if (ready & POLLOUT && !conn->want_close){
+                handle_write(conn);
+            }
+
             if (ready & POLLERR || conn->want_close){
                 (void)close(conn->fd);
                 fd2conn[conn->fd] = NULL;
@@ -570,7 +479,4 @@ int main(){
             }
         }
     }
-
-    
 }
-
